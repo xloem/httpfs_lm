@@ -12,7 +12,7 @@ do
     fi
     revision="${lmurl#*@}"
     lmurl="${lmurl%@*}"
-    httpfspath="${lmurl}/resolve/${revision}"
+    httpfspath="${lmurl}/resolve/${revision//\//%2F}"
 
     if ! type -p httpfs > /dev/null
     then
@@ -23,14 +23,16 @@ do
     lmpath="${lmurl#*//}"
     lmpath="${lmpath#*/}/$revision"
     lmpath="${lmpath//\//_}"
-    if [ -e "$lmpath"/.git/config ]
+    if ! [ -e "$lmpath"/.git/config ]
     then
-        GIT_LFS_SKIP_SMUDGE=1 git -C "$lmpath" checkout "$revision"
-    else
-        GIT_LFS_SKIP_SMUDGE=1 git clone "$lmurl" --branch "$revision" "$lmpath"
+        GIT_LFS_SKIP_SMUDGE=1 git clone "$lmurl" "$lmpath"
     fi
-    {
+    (
         cd "$lmpath"
+        git fetch origin "$revision":"remotes/origin/$revision"
+        GIT_LFS_SKIP_SMUDGE=1 git checkout "remotes/origin/$revision" -b "$revision"
+        git branch --set-upstream-to=origin/"$revision" "$revision"
+        GIT_LFS_SKIP_SMUDGE=1 git pull
         {
             grep --files-with-matches -r https://git-lfs.github.com/spec/v1
             find -L -type l
@@ -50,7 +52,7 @@ do
             while ! [ -e "$filename" ]; do sleep 1; done
             echo "$lmpath/$filename -> $(readlink "$filename")"
         done
-    }
+    )
     echo
     echo "$lmurl" mounted at "$lmpath"
 done
