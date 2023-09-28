@@ -2,7 +2,7 @@
 
 Load Git-LFS files without using disk space.
 
-This quick batch script clones Git-LFS repositories from https://huggingface.co
+This quick bash script clones Git-LFS repositories from https://huggingface.co
 and uses https://github.com/excitoon/httpfs to mount the Git-LFS files via the
 network with FUSE, without ever writing them to disk.
 
