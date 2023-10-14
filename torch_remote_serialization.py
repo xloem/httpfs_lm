@@ -265,3 +265,10 @@ def _load(zip_file, map_location, pickle_module, pickle_file='data.pkl', **pickl
     torch._utils._validate_loaded_sparse_tensors()
 
     return result
+
+def _open_file_like(name_or_buffer, mode):
+    if type(name_or_buffer) is str and name_or_buffer.startswith('http'):
+        import httpio
+        return httpio.open(name_or_buffer, block_size=1024*1024)
+    else:
+        return torch.serialization._open_file_like(name_or_buffer, mode)
