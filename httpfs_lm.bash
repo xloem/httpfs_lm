@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+if [ -e ~/.cache/huggingface/token ]
+then
+    hfhubheader="--header=Authorization: Bearer $(<~/.cache/huggingface/token)"
+else
+    hfhubheader=''
+fi
+
 for lmurl in "$@"
 do
     if [ "${lmurl#http}" == "$lmurl" ]
@@ -14,9 +21,9 @@ do
     lmurl="${lmurl%@*}"
     httpfspath="${lmurl}/resolve/${revision//\//%2F}"
 
-    if ! type -p httpfs > /dev/null
+    if ! type -p httpfs > /dev/null || ! grep args.header $(type -p httpfs) > /dev/null
     then
-        python3 -m pip install git+https://github.com/excitoon/httpfs
+        python3 -m pip install git+https://github.com/xloem/httpfs@5b9b122acb5867f0b0da04b5a3cfb1cf78551741
     fi
     sed -i 's/print(d)/print(d, flush=True)/' $(type -p httpfs) # to process the output in a pipeline
     sed -i 's/, allow_other=True//' $(type -p httpfs) # not always supported
@@ -40,7 +47,7 @@ do
         do
             echo "Mounting $lmpath/$filename .."
             rm "$filename"
-            httpfs "$httpfspath/$filename" | while read line
+            httpfs "$hfhubheader" "$httpfspath/$filename" | while read line
             do
                 echo "$line"
                 if [ "$line" == "..." ]
