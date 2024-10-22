@@ -12,13 +12,31 @@ class Interface(fuse.Operations):
             partial = partial[1:]
         return os.path.join(self.repo.path, partial)
 
-    def getattr(self, path, fh=None):
-        full_path = self._full_path(path)
-        if not os.path.exists(full_path):
-            raise refuse.high.FuseOSError(errno.ENOENT)
 
-        st = os.lstat(full_path)
-        return dict((key, getattr(st, key)) for key in ('st_atime', 'st_mtime', 'st_ctime', 'st_mode', 'st_nlink', 'st_size'))
+    def getattr(self, path, fh=None):
+        # this returns a dict
+        # the cross-platform attributes of fuse.c_stat are:
+        # st_dev, st_ino, st_nlink, st_mode, st_uid, st_gid, st_rdev, st_atimespec, st_mtimespec, st_ctimespec, st_size, st_blocks, st_blksize
+        full_path = self._full_path(path)
+        try:
+            st = os.lstat(full_path)
+        except FileNotFoundError:
+            raise fuse.FuseOSError(errno.ENOENT)
+        stat = dict(
+            st_mode=st[0], st_ino=st[1], st_dev=st[2], st_nlink=st[3],
+            st_uid=st[4], st_gid=st[5], st_size=st[6], st_atime=st[7],
+            st_mtime=st[8], st_ctime=st[9]
+        )
+        if st.st_mode & 0o100000:
+            if st.st_mode & 0o20000:
+                managed_size = self.repo.get_managed_symlink_size(full_path)
+            else:
+                managed_size = self.repo.get_managed_file_size(full_path)
+        else:
+            managed_size = None
+        if managed_size is not None:
+            stat['st_size'] = managed_size
+        return stat
 
     def open(self, path, flags):
         full_path = self._full_path(path)
@@ -38,7 +56,7 @@ class Interface(fuse.Operations):
     def readlink(self, path):
         pathname = os.readlink(self._full_path(path))
         if pathname.startswith("/"):
-            return os.path.relpath(pathname, self.repo_path)
+            return os.path.relpath(pathname, self.repo.path)
         else:
             return pathname
 
