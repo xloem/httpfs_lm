@@ -66,21 +66,20 @@ class LFS:
         self.session = session
 
     def _populate_batch_urls(self):
-        remote_urls = []
+        batch_urls = []
         config = self.dulwich.get_config()
         if self.session is None:
             self.session = requests.Session()
         for section_tuple in config.sections():
             if section_tuple[0] == b'remote':
                 try:
-                    remote_urls.append(config.get(section_tuple, b'url').decode())
+                    remote_url = config.get(section_tuple, b'url').decode()
+                    batch_urls.append(self._remote_url_to_batch_url(remote_url))
                 except KeyError:
                     continue
-        lfs_batch_urls = list(self._remote_urls_to_lfs_batch_urls(*remote_urls))
-        assert(lfs_batch_urls)
         batch_url_proto_hosts = [
             [url, proto.encode(), host.encode()]
-            for url in lfs_batch_urls
+            for url in batch_urls
             for [proto, _, host, path] in [url.split('/',3)]
         ]
         with open(os.path.expanduser('~/.git-credentials'), 'rb') as fh:
@@ -93,8 +92,15 @@ class LFS:
                             "Authorization": "Basic " + token
                         }
                         del auth, token
-        self._fetch_hrefs_pump = _FetchHREFsPump(self)
-        self.batch_urls = lfs_batch_urls
+        working_batch_urls = []
+        for batch_url in batch_urls:
+            try:
+                self._batch(batch_url)
+                working_batch_urls.append(batch_url)
+            except requests.JSONDecodeError:
+                continue
+        assert working_batch_urls
+        self.batch_urls = working_batch_urls
         return self.batch_urls
 
     @staticmethod
@@ -104,15 +110,6 @@ class LFS:
         if url[-3:] == '.git':
             url = url[:-3]
         return url + '.git/info/lfs/objects/batch'
-
-    def _remote_urls_to_lfs_batch_urls(self, *remote_urls):
-        for remote_url in remote_urls:
-            batch_url = self._remote_url_to_batch_url(remote_url)
-            try:
-                self._batch(batch_url)
-                yield batch_url
-            except requests.JSONDecodeError:
-                continue
     
     def get_by_path(self, path, st, fd):
         pointer = self._pointer(path, fd)
