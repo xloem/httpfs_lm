@@ -10,10 +10,10 @@ class Interface(fuse.Operations):
     def _full_path(self, partial):
         if partial.startswith("/"):
             partial = partial[1:]
-        return os.path.join(self.repo.path, partial)
+        return os.path.join(self.repo.rootdir, partial)
 
 
-    def getattr(self, path, fh=None):
+    def getattr(self, path, fi):
         # this returns a dict
         # the cross-platform attributes of fuse.c_stat are:
         # st_dev, st_ino, st_nlink, st_mode, st_uid, st_gid, st_rdev, st_atimespec, st_mtimespec, st_ctimespec, st_size, st_blocks, st_blksize
@@ -27,27 +27,23 @@ class Interface(fuse.Operations):
             st_uid=st[4], st_gid=st[5], st_size=st[6], st_atime=st[7],
             st_mtime=st[8], st_ctime=st[9]
         )
-        if st.st_mode & 0o100000:
-            if st.st_mode & 0o20000:
-                managed_size = self.repo.get_managed_symlink_size(full_path)
-            else:
-                managed_size = self.repo.get_managed_file_size(full_path)
-        else:
-            managed_size = None
-        if managed_size is not None:
-            stat['st_size'] = managed_size
+        external = self.repo.get_by_path(full_path, st)
+        if external is not None:
+            stat['st_size'] = external.size
         return stat
 
-    def open(self, path, flags):
+    def open(self, path, flags, fi):
         full_path = self._full_path(path)
-        return os.open(full_path, flags)
+        fi.fh = os.open(full_path, flags)
+        return 0
 
-    def read(self, path, size, offset, fh):
+    def read(self, path, size, offset, fi):
+        fh = fi.fh
         with self.lock:  # Ensure thread-safe reads
             os.lseek(fh, offset, os.SEEK_SET)
             return os.read(fh, size)
 
-    def readdir(self, path, fh):
+    def readdir(self, path, fi):
         full_path = self._full_path(path)
         dirents = ['.', '..'] + os.listdir(full_path)
         for r in dirents:
@@ -149,4 +145,4 @@ if __name__ == "__main__":
             mountpoint = os.path.abspath(args.mountpoint or args.repo_path)
             repository = repo.Repo(repo_path)
             backend = Interface(repository, mountpoint)
-            FUSEWithRawArgs(backend, parser.prog, mountpoint, *args.fuse_args)
+            FUSEWithRawArgs(backend, parser.prog, mountpoint, raw_fi=True, *args.fuse_args)
