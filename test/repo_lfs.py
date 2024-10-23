@@ -55,17 +55,21 @@ class LFS:
             CAPACITY: "The server has insufficient storage capacity to complete the request.",
             BANDWIDTH: "The bandwidth limit for the user or repository has been exceeded. The API does not specify any bandwidth limit, but implementors may track usage.",
         }
-    def __init__(self, dulwich, workdir, controldir, lfs_batch_urls=None, session=requests):
+    def __init__(self, dulwich, workdir, controldir, lfs_batch_urls=None, session=None):
         self.dulwich = dulwich
         self.workdir = workdir
         self.controldir = controldir
+        self._lock = threading.Lock()
         self._files = {}
         self._auths = {}
         self.lfs_batch_urls = lfs_batch_urls
+        self.session = session
 
     def _populate_batch_urls(self):
         remote_urls = []
         config = self.dulwich.get_config()
+        if self.session is None:
+            self.session = requests.Session()
         for section_tuple in config.sections():
             section, name = section_tuple
             if section == b'remote':
@@ -113,8 +117,8 @@ class LFS:
             except requests.JSONDecodeError:
                 continue
     
-    def get_by_path(self, path, st):
-        pointer = self._pointer(path)
+    def get_by_path(self, path, st, fd):
+        pointer = self._pointer(path, fd)
         if pointer is None:
             return None;
         short_oid = pointer['oid'].split(':',1)[-1]
@@ -180,19 +184,27 @@ class LFS:
                 file.update_href(url, action['expires_at'], **auth, **action.get('header',{}))
             result[file.short_oid] = file
         return result
-    def _pointer(self, path):
-        fd = os.open(path, os.O_RDONLY)
+    def _pointer(self, path, fd):
+        if fd is None:
+            read_fd = os.open(path, os.O_RDONLY)
+        else:
+            read_fd = fd
+            start = os.lseek(fd, os.SEEK_CUR)
+            assert start == 0 # feel free to change the logic around this
         try:
-            if os.read(fd, len(self.MAGIC)) != self.MAGIC:
+            if os.read(read_fd, len(self.MAGIC)) != self.MAGIC:
                 return None
             return dict([
                 entry.split(' ',1)
-                for entry in os.read(fd, 1024*1024)[:-1].decode().split('\n')
+                for entry in os.read(read_fd, 1024*1024)[:-1].decode().split('\n')
             ])
         except:
             return None
         finally:
-            os.close(fd)
+            if read_fd != fd:
+                os.close(read_fd)
+            else:
+                os.lseek(fd, start)
 
 class LFSFile:
     def __init__(self, lfs, path, pointer):
@@ -205,13 +217,28 @@ class LFSFile:
         self.expires_at = 0
         self.batch_urls = None
         self.errors = {}
+        self.lock = threading.Lock()
     def open(self):
-        if not os.path.exists(os.path.join(self.lfs.controldir, self.lfs_path)):
-            if self.batch_urls is None:
-                self.batch_urls = set(self.lfs.batch_urls or self.lfs._populate_batch_urls())
-            while self.expired():
-                self.lfs._fetch_hrefs_pump.add(self).result()
-        ...
+        with self.lock:
+            lfs_path = os.path.join(self.lfs.controldir, self.lfs_path)
+            if not os.path.exists(lfs_path):
+                if self.batch_urls is None:
+                    with self.lfs._lock:
+                        self.batch_urls = set(self.lfs.batch_urls or self.lfs._populate_batch_urls())
+                while self.expired():
+                    self.lfs._fetch_hrefs_pump.add(self).result()
+                self.fd = None
+            else:
+                self.fd = os.open(lfs_path, os.O_RDONLY)
+    def close(self):
+        os.close(self.fd)
+    def read(self, size, offset):
+        if self.fd is not None:
+            with self.lock:
+                os.lseek(self.fd, offset, os.SEEK_SET)
+                return os.read(self.fd, size)
+        else:
+        
     def update_href(self, href, expires_at, **headers):
         self.href = href
         if type(expires_at) is str:
@@ -235,12 +262,11 @@ class LFSException(RuntimeError):
 class _FetchHREFsPump:
     def __init__(self, repo):
         self.repo = repo
-        self.lock = threading.Lock()
         self.queue = []
         self.fut = None
         super().__init__()
     def add(self, *files):
-        with self.lock:
+        with self.repo._lock:
             self.queue.extend(files)
             if self.fut is None:
                 self.fut = concurrent.futures.Future()
@@ -249,7 +275,7 @@ class _FetchHREFsPump:
             return self.fut
     def _run(self):
         while True:
-            with self.lock:
+            with self.repo._lock:
                 chunk = self.queue
                 if not len(chunk):
                     self.fut = None

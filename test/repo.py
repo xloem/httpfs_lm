@@ -13,9 +13,9 @@ class Repo:
             Backend(self.dulwich, self.rootdir, self.gitdir)
             for Backend in [LFS, Annex]
         ]
-    def get_by_path(self, path, st):
+    def get_by_path(self, path, st=None, fd=None):
         for backend in self.backends:
-            f = backend.get_by_path(path, st)
+            f = backend.get_by_path(path, st, fd)
             if f is not None:
                 break
         return f

@@ -6,7 +6,9 @@ class Annex:
         self.dulwich = dulwich
         self.workdir = workdir
         self.controldir = controldir
-    def get_by_path(self, path, st):
+    def get_by_path(self, path, st, fd):
+        if st is None:
+            st = os.lstat(path)
         if not st.st_mode & 0o770000 == 0o120000:
             return None
         link = os.readlink(path)

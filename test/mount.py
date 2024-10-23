@@ -6,7 +6,34 @@ class Interface(fuse.Operations):
     def __init__(self, repo, mountpath):
         self.repo = repo
         self.lock = threading.Lock()
+        self.external_fds = []
+        self.external_fd_next = None
 
+    def _external_fd_alloc(self, obj):
+        with self.lock:
+            if self.next_external_fd is not None:
+                fd = self.external_fd_next
+                self.external_fd_next = self.external_fds[fd]
+                self.external_fds[fd] = obj
+            else:
+                fd = len(self.external_fds)
+                self.external_fds.append(obj)
+        fd = -fd - 1
+        return fd
+    def _external_fd_free(self, fd):
+        fd = -fd - 1
+        with self.lock:
+            self.external_fds[fd] = self.external_fd_next
+            self.external_fd_next = fd
+    def _external_get(self, path, st, fd):
+        if fd is not None:
+            if fd < 0:
+                return self.external_fds[fd]
+            else:
+                return None
+        else:
+            return self.repo.get_by_path(path, st)
+    
     def _full_path(self, partial):
         if partial.startswith("/"):
             partial = partial[1:]
@@ -27,21 +54,28 @@ class Interface(fuse.Operations):
             st_uid=st[4], st_gid=st[5], st_size=st[6], st_atime=st[7],
             st_mtime=st[8], st_ctime=st[9]
         )
-        external = self.repo.get_by_path(full_path, st)
+        external = self._external_get(full_path, st, fi.fh)
         if external is not None:
             stat['st_size'] = external.size
         return stat
 
     def open(self, path, flags, fi):
         full_path = self._full_path(path)
-        fi.fh = os.open(full_path, flags)
+        external = self.repo.get_by_path(full_path)
+        if external is not None:
+            fi.fh = self._external_fd_alloc(external)
+        else:
+            fi.fh = os.open(full_path, flags)
         return 0
 
     def read(self, path, size, offset, fi):
         fh = fi.fh
-        with self.lock:  # Ensure thread-safe reads
-            os.lseek(fh, offset, os.SEEK_SET)
-            return os.read(fh, size)
+        if fh >= 0:
+            with self.lock:  # Ensure thread-safe reads
+                os.lseek(fh, offset, os.SEEK_SET)
+                return os.read(fh, size)
+        else:
+            external = self._external_get(path, None, fh)
 
     def readdir(self, path, fi):
         full_path = self._full_path(path)
