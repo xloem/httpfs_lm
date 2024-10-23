@@ -7,13 +7,15 @@ class Repo:
     def __init__(self, root):
         import dulwich.repo
         self.dulwich = dulwich.repo.Repo(root)
-        self.rootdir = self.dulwich.path
-        self.gitdir = self.dulwich.controldir()
+        self.rootdir = os.path.normpath(self.dulwich.path)
+        self.gitdir = os.path.normpath(self.dulwich.controldir())
         self.backends = [
             Backend(self.dulwich, self.rootdir, self.gitdir)
             for Backend in [LFS, Annex]
         ]
     def get_by_path(self, path, st=None, fd=None):
+        if path.startswith(self.gitdir):
+            return None
         for backend in self.backends:
             f = backend.get_by_path(path, st, fd)
             if f is not None:

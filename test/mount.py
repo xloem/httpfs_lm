@@ -3,42 +3,49 @@ import fuse
 from . import repo
 
 class Interface(fuse.Operations):
+    XATTR_PFX = 'user.'
     def __init__(self, repo, mountpath):
-        self.repo = repo
-        self.lock = threading.Lock()
-        self.external_fds = []
-        self.external_fd_next = None
+        self._repo = repo
+        self._lock = threading.Lock()
+        self._external_fds = []
+        self._external_fd_next = None
 
+    def _external_fd_to_idx(self, fd):
+        return fd - 0x10000
+    def _external_idx_to_fd(self, idx):
+        return idx + 0x10000
+    def _external_fd_check(self, fd):
+        return fd >= 0x10000
     def _external_fd_alloc(self, obj):
-        with self.lock:
-            if self.next_external_fd is not None:
-                fd = self.external_fd_next
-                self.external_fd_next = self.external_fds[fd]
-                self.external_fds[fd] = obj
+        with self._lock:
+            if self._external_fd_next is not None:
+                idx = self._external_fd_next
+                self._external_fd_next = self._external_fds[idx]
+                self._external_fds[idx] = obj
             else:
-                fd = len(self.external_fds)
-                self.external_fds.append(obj)
-        fd = -fd - 1
-        return fd
+                idx = len(self._external_fds)
+                self._external_fds.append(obj)
+        return self._external_idx_to_fd(idx)
     def _external_fd_free(self, fd):
-        fd = -fd - 1
-        with self.lock:
-            self.external_fds[fd] = self.external_fd_next
-            self.external_fd_next = fd
+        idx = self._external_fd_to_idx(fd)
+        with self._lock:
+            self._external_fds[idx] = self._external_fd_next
+            self._external_fd_next = idx
     def _external_get(self, path, st, fd):
         if fd is not None:
-            if fd < 0:
-                return self.external_fds[fd]
+            if self._external_fd_check(fd):
+                return self._external_fds[self._external_fd_to_idx(fd)]
             else:
                 return None
         else:
-            return self.repo.get_by_path(path, st)
+            return self._repo.get_by_path(path, st)
     
-    def _full_path(self, partial):
-        if partial.startswith("/"):
-            partial = partial[1:]
-        return os.path.join(self.repo.rootdir, partial)
-
+    def _full_path(self, path):
+        assert path[0] == '/'
+        if len(path) == 1:
+            return '.'
+        else:
+            return path[1:]
 
     def getattr(self, path, fi):
         # this returns a dict
@@ -54,28 +61,53 @@ class Interface(fuse.Operations):
             st_uid=st[4], st_gid=st[5], st_size=st[6], st_atime=st[7],
             st_mtime=st[8], st_ctime=st[9]
         )
-        external = self._external_get(full_path, st, fi.fh)
+        external = self._external_get(full_path, st, fi and fi.fh)
         if external is not None:
             stat['st_size'] = external.size
         return stat
 
-    def open(self, path, flags, fi):
+    def listxattr(self, path):
         full_path = self._full_path(path)
-        external = self.repo.get_by_path(full_path)
+        external = self._repo.get_by_path(full_path)
+        if external is not None:
+            return [
+                self.XATTR_PFX + name
+                for name, val in external.__dict__.items()
+                if type(val) in [str,int]
+            ]
+        else:
+            return []
+
+    def getxattr(self, path, name):
+        if name[:len(self.XATTR_PFX)] == self.XATTR_PFX:
+            full_path = self._full_path(path)
+            external = self._repo.get_by_path(full_path)
+            if external is not None:
+                try:
+                    return str(getattr(external, name[len(self.XATTR_PFX):])).encode()
+                except AttributeError:
+                    pass
+        raise fuse.FuseOSError(fuse.errno.ENODATA)
+
+    def open(self, path, fi):
+        full_path = self._full_path(path)
+        external = self._repo.get_by_path(full_path)
         if external is not None:
             fi.fh = self._external_fd_alloc(external)
+            external.open()
         else:
-            fi.fh = os.open(full_path, flags)
+            fi.fh = os.open(full_path, fi.flags)
         return 0
 
     def read(self, path, size, offset, fi):
         fh = fi.fh
-        if fh >= 0:
-            with self.lock:  # Ensure thread-safe reads
+        external = self._external_get(path, None, fh)
+        if external is None:
+            with self._lock:  # Ensure thread-safe reads
                 os.lseek(fh, offset, os.SEEK_SET)
                 return os.read(fh, size)
         else:
-            external = self._external_get(path, None, fh)
+            return external.read(size, offset)
 
     def readdir(self, path, fi):
         full_path = self._full_path(path)
@@ -86,7 +118,7 @@ class Interface(fuse.Operations):
     def readlink(self, path):
         pathname = os.readlink(self._full_path(path))
         if pathname.startswith("/"):
-            return os.path.relpath(pathname, self.repo.path)
+            return os.path.relpath(pathname, self._repo.path)
         else:
             return pathname
 
@@ -169,14 +201,17 @@ if __name__ == "__main__":
             repo.Repo.cmd_clone(args.clone_args)
 
     elif args.command == "mount":
+        if args.mountpoint is None:
+            args.fuse_args[:0] = ['-o', 'nonempty']
+            args.mountpoint = args.repo_path
         if args.help or not args.mountpoint:
             try:
                 FUSEWithRawArgs(None, parser.prog + ' mount [repo_path]', '--help')
             except RuntimeError as err:
                 sys.exit(*err.args)
         else:
-            repo_path = os.path.abspath(args.repo_path)
-            mountpoint = os.path.abspath(args.mountpoint or args.repo_path)
-            repository = repo.Repo(repo_path)
+            mountpoint = os.path.abspath(args.mountpoint)
+            os.chdir(args.repo_path)
+            repository = repo.Repo('.')
             backend = Interface(repository, mountpoint)
             FUSEWithRawArgs(backend, parser.prog, mountpoint, raw_fi=True, *args.fuse_args)

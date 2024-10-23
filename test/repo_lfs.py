@@ -20,7 +20,7 @@
 #  .git-credentials format: https://user:pass@host.com this format is allowed in git remote urls
 # Authorization: Basic {base64("user:pass")}
 
-import concurrent.futures, datetime, os, threading, time, datetime
+import base64, concurrent.futures, datetime, os, threading, time, datetime
 import requests
 
 class LFS:
@@ -62,7 +62,7 @@ class LFS:
         self._lock = threading.Lock()
         self._files = {}
         self._auths = {}
-        self.lfs_batch_urls = lfs_batch_urls
+        self.batch_urls = lfs_batch_urls
         self.session = session
 
     def _populate_batch_urls(self):
@@ -71,28 +71,25 @@ class LFS:
         if self.session is None:
             self.session = requests.Session()
         for section_tuple in config.sections():
-            section, name = section_tuple
-            if section == b'remote':
+            if section_tuple[0] == b'remote':
                 try:
-                    url = config.get(section_tuple, b'url').decode()
-                    if self.is_lfs_remote(url):
-                        remote_urls.append(url)
+                    remote_urls.append(config.get(section_tuple, b'url').decode())
                 except KeyError:
                     continue
-        lfs_batch_urls = list(self.remote_urls_to_lfs_batch_urls(remote_urls))
+        lfs_batch_urls = list(self._remote_urls_to_lfs_batch_urls(*remote_urls))
         assert(lfs_batch_urls)
-        batch_url_proto_hosts = {
+        batch_url_proto_hosts = [
             [url, proto.encode(), host.encode()]
             for url in lfs_batch_urls
             for [proto, _, host, path] in [url.split('/',3)]
-        }
+        ]
         with open(os.path.expanduser('~/.git-credentials'), 'rb') as fh:
             for line in fh.read().split(b'\n'):
                 for url, proto, host in batch_url_proto_hosts:
                     if line.startswith(proto) and line.endswith(host):
                         auth = line[len(proto)+2:-len(host)-1]
-                        token = base64.b64encode(auth)
-                        self._auth[url] = {
+                        token = base64.b64encode(auth).decode()
+                        self._auths[url] = {
                             "Authorization": "Basic " + token
                         }
                         del auth, token
@@ -107,12 +104,12 @@ class LFS:
         if url[-3:] == '.git':
             url = url[:-3]
         return url + '.git/info/lfs/objects/batch'
-    @classmethod
-    def remote_urls_to_lfs_batch_urls(cls, *remote_urls, session=requests):
+
+    def _remote_urls_to_lfs_batch_urls(self, *remote_urls):
         for remote_url in remote_urls:
-            batch_url = cls._remote_url_to_batch_url(remote_url)
+            batch_url = self._remote_url_to_batch_url(remote_url)
             try:
-                cls._batch(batch_url, session=session)
+                self._batch(batch_url)
                 yield batch_url
             except requests.JSONDecodeError:
                 continue
@@ -121,27 +118,26 @@ class LFS:
         pointer = self._pointer(path, fd)
         if pointer is None:
             return None;
-        short_oid = pointer['oid'].split(':',1)[-1]
-        file = self._files.get(short_oid)
+        oid_short = pointer['oid'].split(':',1)[-1]
+        file = self._files.get(oid_short)
         if file is None:
             file = LFSFile(self, path, pointer)
-            assert file.short_oid == short_oid
-            self._files[file.short_oid] = file
+            assert file.oid_short == oid_short
+            self._files[file.oid_short] = file
         return file
     
-    @classmethod
-    def _batch(cls, batch_url, *oid_size_pairs, operation='download', transfers=None, ref=None, hash_algo=None, session=requests):
+    def _batch(self, batch_url, *oid_size_pairs, operation='download', transfers=None, ref=None, hash_algo=None):
         headers = {
-            **self._auth.get(batch_url, {}),
-            'Accept': cls.MIME,
-            'Content-Type': cls.MIME,
+            **self._auths.get(batch_url, {}),
+            'Accept': self.MIME,
+            'Content-Type': self.MIME,
         }
-        data = '{"operation":"'+operation;
+        data = '{"operation":"'+operation+'"'
         if transfers is not None:
             data += ',"transfers":['+','.join(['"'+tx+'"' for tx in transfers])+']'
         if ref is not None:
             data += ',"ref":{"name":"' + ref + '"}'
-        data += ',objects:['
+        data += ',"objects":['
         for oid, size in oid_size_pairs:
             idx = oid.find(':')
             if idx != -1:
@@ -151,12 +147,12 @@ class LFS:
                     hash_algo = oid_hash_algo
                 else:
                     assert hash_algo == oid_hash_algo
-            data += '{"oid":"'+oid+'","size":'+size+'}'
+            data += '{"oid":"'+oid+'","size":'+str(size)+'}'
         data += ']'
         if hash_algo not in [None, 'sha256']:
             data += ',"hash_algo":"' + hash_algo + '"'
         data += '}'
-        res_http = session.post(url, headers=headers, data=data)
+        res_http = self.session.post(batch_url, headers=headers, data=data)
         res_json = res_http.json()
         if 'message' in res_json:
             raise LFSException(res_http.status_code, **res_json, request=res_http.request, response=res_http, document=res_json)
@@ -166,12 +162,12 @@ class LFS:
         res_json.setdefault('hash_algo','sha256')
         return [res_http, res_json]
     def _fetch_hrefs_for(self, batch_url, ref=None, hash_algo=None, **files):
-        http, res = self._batch(batch_url, [[pointer['oid'],pointer['size']] for pointer in pointers_by_oid.values()], operation='download', ref=ref, hash_algo=hash_algo)
-        auth = self._auth.get(batch_url,{})
+        http, res = self._batch(batch_url, *[[file.oid_short, file.size] for file in files.values()], operation='download', ref=ref, hash_algo=hash_algo)
+        auth = self._auths.get(batch_url,{})
         result = {}
         for object in res['objects']:
-            short_oid = object['oid']
-            file = files[short_oid]
+            oid_short = object['oid']
+            file = files[oid_short]
             if 'error' in object:
                 error = LFSException(**object['error'], response=http, request=http.request, document=object)
                 file.batch_urls.remove(batch_url)
@@ -179,10 +175,10 @@ class LFS:
             else:
                 assert file.size == object['size']
                 # if not object.get('authenticated') then credentials are not yet correct
-                action = object['action']['download']
+                action = object['actions']['download']
                 url = action['href']
-                file.update_href(url, action['expires_at'], **auth, **action.get('header',{}))
-            result[file.short_oid] = file
+                file.update_href(url, action.get('expires_at',None), **auth, **action.get('header',{}))
+            result[file.oid_short] = file
         return result
     def _pointer(self, path, fd):
         if fd is None:
@@ -210,9 +206,9 @@ class LFSFile:
     def __init__(self, lfs, path, pointer):
         self.lfs = lfs
         self.path = path
-        self.full_oid = pointer['oid']
-        self.hash_algo, self.short_oid = self.full_oid.split(':',1)
-        self.lfs_path = os.path.join('lfs', 'objects', self.short_oid[:2], self.short_oid[2:4], self.short_oid)
+        self.oid_full = pointer['oid']
+        self.hash_algo, self.oid_short = self.oid_full.split(':',1)
+        self.lfs_path = os.path.join('lfs', 'objects', self.oid_short[:2], self.oid_short[2:4], self.oid_short)
         self.size = int(pointer['size'])
         self.expires_at = 0
         self.batch_urls = None
@@ -238,6 +234,8 @@ class LFSFile:
                 os.lseek(self.fd, offset, os.SEEK_SET)
                 return os.read(self.fd, size)
         else:
+            resp = self.lfs.session.get(self.href, headers={**self.headers, 'Range': 'bytes='+str(offset)+'-'+str(offset+size-1)})
+            return resp.content
         
     def update_href(self, href, expires_at, **headers):
         self.href = href
@@ -246,7 +244,7 @@ class LFSFile:
         self.expires_at = expires_at
         self.headers = headers
     def expired(self):
-        return time.time() > self.expires_at
+        return self.expires_at is not None and time.time() > self.expires_at
 
 class LFSException(RuntimeError):
     def __init__(self, code, message, request_id=None, documentation_url=None, request=None, response=None, document=None):
@@ -257,7 +255,7 @@ class LFSException(RuntimeError):
         self.request = request
         self.response = response
         self.document = document
-        super().__init__(code, message, request_id, documentation_url, request, response)
+        super().__init__(code, message, request_id, documentation_url, request, response, document)
 
 class _FetchHREFsPump:
     def __init__(self, repo):
@@ -281,23 +279,23 @@ class _FetchHREFsPump:
                     self.fut = None
                     break
                 fut = self.fut
-                self.queue = set()
+                self.queue = []
                 self.fut = concurrent.futures.Future()
-            chunk = {file.short_oid:file for file in chunk}
+            chunk = {file.oid_short:file for file in chunk}
             all_oids = set(chunk)
             hash_algo_batch_url_oids = {}
-            for file in chunk:
+            for file in chunk.values():
                 for batch_url in file.batch_urls:
-                    key = [file.hash_algo, batch_url]
+                    key = (file.hash_algo, batch_url)
                     entry = hash_algo_batch_url_oids.get(key)
                     if entry is None:
                         entry = set()
-                        hash_algo_batch_url_oids[batch_url] = entry
-                    entry.add(file.short_oid)
+                        hash_algo_batch_url_oids[key] = entry
+                    entry.add(file.oid_short)
             (hash_algo, batch_url), oids = max(hash_algo_batch_url_oids.items(), key=lambda item:len(item[1]))
             self.add(*[chunk.pop(oid) for oid in (all_oids - oids)])
             try:
-                result = self.repo._fetch_hrefs_for(batch_url, hash_algo=hash_alog, **chunk)
+                result = self.repo._fetch_hrefs_for(batch_url, hash_algo=hash_algo, **chunk)
                 fut.set_result(result)
             except Exception as exc:
                 fut.set_exception(exc)
